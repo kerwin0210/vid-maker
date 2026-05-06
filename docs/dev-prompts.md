@@ -11,10 +11,17 @@
 Phase 0  基础设施   Step 0.1 Monorepo 骨架 → Step 0.2 Docker 本地服务
 Phase 1  数据层     Step 1.1 Drizzle Schema → Step 1.2 Zod Schemas → Step 1.3 BullMQ Queue
 Phase 2  API 核心   Step 2.1 Hono 骨架 → Step 2.2 积分 API → Step 2.3 状态机 API → Step 2.4 SSE
-Phase 3  Worker     Step 3.1 分镜生成 → Step 3.2 视频生产
-Phase 4  前端       Step 4.1 Next.js 初始化 → Step 4.2 Step1-3 → Step 4.3 Step4-5+积分
+Phase 3  Worker     Step 3.1 Provider 抽象层 → Step 3.2 分镜生成 → Step 3.3 视频生产 → Step 3.4 视频分析
+Phase 4  前端       Step 4.1 Next.js 初始化 → Step 4.2 Step1-3 → Step 4.3 Step4-5+积分+导出
 Phase 5  联调       Step 5.1 E2E 冒烟测试
 ```
+
+> **模型版本说明**（基于 2026 Benchmark）：
+> - 图片：FLUX 2 Pro（`black-forest-labs/flux-2-pro` on Replicate，$0.03/张）
+> - 视频：Kling 3.0（`fal-ai/kling-video/v3/pro` on fal.ai，$0.112/秒）
+> - TTS：MiniMax Speech-02（全球 #1，中文 WER 2.252%）
+> - ASR：Faster-Whisper large-v3（本地，WER 1.5%，零成本）
+> - 脚本：Claude Sonnet 4.6（JSON 合规 98%+）
 
 ---
 
@@ -115,7 +122,7 @@ packages/queue/package.json：
 ```
 为 vid-maker 创建 packages/db 的完整 Drizzle ORM schema。
 
-参考 docs/architecture.md 第四节，在 packages/db/src/schema/ 下创建以下文件：
+参考 docs/architecture.md 第四节（v1.1），在 packages/db/src/schema/ 下创建以下文件：
 
 1. users.ts
    字段：id(uuid PK) / phone(varchar 11, unique) / wechat_openid(varchar 64, unique) /
@@ -128,18 +135,29 @@ packages/queue/package.json：
 
 3. projects.ts
    - projectStatusEnum：draft / script_approved / storyboard_done / producing / done / failed
-   - inputModeEnum：prompt / article / outline
-   - projects 表：id / user_id(FK) / status(enum, default draft) / input_mode / raw_input(text) /
-                  spec_json(text) / estimated_cost_cny(integer) / total_cost_cny(integer) /
-                  final_video_url(text) / parent_project_id(uuid) / created_at / updated_at
-   - scenes 表：id / project_id(FK cascade) / scene_order(integer) / narration(text) /
-               visual_prompt(text) / camera_motion(varchar 128) / duration_sec(integer) /
-               image_url(text) / audio_path(text) / video_path(text)
+   - inputModeEnum：prompt / article / outline / video（新增：视频导入分析模式）
+   - projects 表：id / user_id(FK) / status / input_mode / raw_input(text) /
+                  spec_json(text) / source_video_url(text，视频导入模式) /
+                  estimated_cost_cny / total_cost_cny /
+                  final_video_url(text) / subtitle_url(text，SRT 字幕) /
+                  parent_project_id(uuid) / created_at / updated_at
+   - scenes 表：id / project_id(FK cascade) / scene_order / narration(text) /
+               visual_prompt(text) / camera_motion(varchar 128) / duration_sec /
+               shot_type(varchar 32，可空) / composition(varchar 32，可空) /
+               lighting(varchar 32，可空) / color_tone(varchar 32，可空) /
+               selected_image_id(uuid，可空) / selected_video_id(uuid，可空) /
+               audio_path(text)
 
-4. jobs.ts
-   - generationJobTypeEnum：script / storyboard / tts / video / assemble
-   - generationJobs 表：id / project_id(FK) / type(enum) / status(varchar 16, default pending) /
-                        ai_cost_cny(integer, default 0) / started_at / finished_at / error_msg(text)
+4. scene-assets.ts（新增：多版本资产表）
+   - sceneAssets 表：id / scene_id(FK cascade) / type(varchar 16: image|video) /
+                    url(text) / provider(varchar 32) / cost_cny(integer) /
+                    is_selected(boolean, default false) / created_at
+
+5. jobs.ts
+   - generationJobTypeEnum：analyze / script / storyboard / tts / video / subtitle / assemble
+   - generationJobs 表：id / project_id(FK) / type(enum) / status(varchar 16) /
+                        provider(varchar 32，记录使用的 Provider) /
+                        ai_cost_cny(integer) / started_at / finished_at / error_msg(text)
 
 5. index.ts：统一导出所有 schema 和 enum
 
@@ -166,21 +184,29 @@ packages/queue/package.json：
 
 1. project.schema.ts：
    - ProjectStatusSchema = z.enum(['draft','script_approved','storyboard_done','producing','done','failed'])
-   - InputModeSchema = z.enum(['prompt','article','outline'])
+   - InputModeSchema = z.enum(['prompt','article','outline','video'])  ← 新增 video
    - AspectRatioSchema = z.enum(['16:9','9:16','1:1'])
    - DurationPresetSchema = z.enum(['30s','1min','2min','5min'])
+   - ShotTypeSchema = z.enum(['close_up','medium','full','long','extreme_long']).optional()
+   - CompositionSchema = z.enum(['rule_of_thirds','symmetry','golden_ratio','center']).optional()
+   - LightingSchema = z.enum(['natural','soft','backlight','sidelight','toplight']).optional()
+   - ColorToneSchema = z.enum(['warm','cool','high_contrast','desaturated']).optional()
+   - ProfessionalParamsSchema（shot_type? / composition? / lighting? / color_tone?）
    - VideoSpecSchema（duration_preset / aspect_ratio / visual_style / voice_id）
    - SceneSchema（id / narration / visual_prompt / camera_motion / duration_sec /
-                 image_url? / audio_path? / video_path?）
+                 professional_params?: ProfessionalParams /
+                 selected_image_url? / selected_video_url? / audio_path?）
+   - SceneAssetSchema（id / scene_id / type / url / provider / cost_cny / is_selected）
    - CreateProjectSchema（input_mode / raw_input(min 1, max 2000) /
+                         source_video_url?(视频导入模式) /
                          duration_preset / aspect_ratio / visual_style / voice_id /
                          parent_project_id?）
-   - ScenePatchSchema（narration? / visual_prompt? / camera_motion? / duration_sec?）
+   - ScenePatchSchema（narration? / visual_prompt? / camera_motion? / duration_sec? / professional_params?）
    - VALID_TRANSITIONS: Record<ProjectStatus, ProjectStatus[]>（完整映射）
    - assertValidTransition(from, to)：非法时抛 Error
    - SCENE_COUNT_MAP: { '30s':5, '1min':10, '2min':20, '5min':40 }
    - DURATION_SEC_MAP: { '30s':30, '1min':60, '2min':120, '5min':300 }
-   - estimateCreditCost(spec: VideoSpec): number（按 architecture.md 第六节定价矩阵）
+   - estimateCreditCost(spec: VideoSpec): number（按 architecture.md 第六节定价矩阵，基于 Kling 3.0 + FLUX 2 Pro + MiniMax 成本）
 
 2. billing.schema.ts：
    - CreditTxTypeSchema = z.enum([...])
@@ -209,11 +235,15 @@ packages/queue/package.json：
    - 导出 redis（IORedis 实例，读 process.env.REDIS_URL，lazyConnect: true）
    - 导出 redisConnection（BullMQ 用的精简连接配置对象，不含 lazyConnect）
 
-2. jobs/storyboard.job.ts：
+2. jobs/analyze.job.ts（新增：视频导入分析）：
+   - AnalyzeJobSchema = z.object({ project_id, user_id, credit_cost, source_video_url, spec })
+   - 导出 AnalyzeJobData
+
+3. jobs/storyboard.job.ts：
    - StoryboardJobSchema = z.object({ project_id, user_id, credit_cost, scenes, spec })
    - 导出 StoryboardJobData = z.infer<typeof StoryboardJobSchema>
 
-3. jobs/produce.job.ts：
+4. jobs/produce.job.ts：
    - ProduceJobSchema = z.object({ project_id, user_id, credit_cost, scenes, spec, storyboard_urls })
    - 导出 ProduceJobData = z.infer<typeof ProduceJobSchema>
 
@@ -416,42 +446,199 @@ SSE 消息格式（data 字段为 JSON 字符串）：
 
 ## Phase 3：Worker
 
-### Step 3.1 — 分镜生成 Worker
+### Step 3.1 — AI Provider 抽象层
+
+> 发送前打开：`docs/architecture.md`（第九节 Provider 抽象层）
+
+```
+为 vid-maker 创建 apps/worker/src/providers/ 可插拔 AI Provider 抽象层。
+
+在 apps/worker/src/providers/ 下创建三组 Provider：
+
+1. image/image.provider.ts（接口）：
+interface ImageProvider {
+  name: string
+  generate(prompt: string, spec: VideoSpec, professionalParams?: ProfessionalParams): Promise<{ url: string; costCny: number }>
+}
+
+2. image/flux2pro.provider.ts（主选）：
+- 调用 Replicate black-forest-labs/flux-2-pro
+- prompt 融合专业参数：shot_type/composition/lighting/color_tone
+- 成本：$0.03 × 7.2 = 216 分/张
+
+3. image/ideogram.provider.ts（备选，文字入画场景）：
+- 调用 Ideogram v3 API
+- 适用场景：visual_prompt 包含文字/标题/logo 时
+
+4. video/video.provider.ts（接口）：
+interface VideoProvider {
+  name: string
+  generate(imageUrl: string, prompt: string, durationSec: number, cameraMotion: string): Promise<{ url: string; costCny: number }>
+}
+
+5. video/kling.provider.ts（主选）：
+- 调用 fal.ai fal-ai/kling-video/v3/pro/image-to-video
+- 成本：$0.112/秒 × durationSec × 7.2
+
+6. video/runway.provider.ts（备选）：
+- 调用 Runway Gen-4 API
+- 成本：$0.12/秒 × durationSec × 7.2
+
+7. tts/tts.provider.ts（接口）：
+interface TtsProvider {
+  name: string
+  synthesize(text: string, voiceId: string): Promise<{ audioPath: string; costCny: number }>
+}
+
+8. tts/minimax.provider.ts（主选）：
+- 调用 MiniMax Speech-02 API
+- endpoint: https://api.minimax.chat/v1/t2a_v2
+- 成本：$50/1M字符 × chars × 7.2
+
+9. tts/elevenlabs.provider.ts（备选）：
+- 调用 ElevenLabs v3 API（多语言/克隆场景）
+
+10. provider.factory.ts（工厂）：
+- 读取环境变量 IMAGE_PROVIDER / VIDEO_PROVIDER / TTS_PROVIDER
+- 返回对应 Provider 实例
+- dev 环境无 Key 时返回 MockProvider（生成占位资源）
+
+要求：
+- 所有 Provider 实现相同接口，Worker 业务逻辑不感知具体 Provider
+- Mock Provider 返回固定测试资源，不阻塞开发流程
+- 成本计算统一在各 Provider 内完成，调用方不需要知道计费逻辑
+```
+
+---
+
+### Step 3.2 — 分镜生成 Worker
 
 > 发送前打开：`.cursor/rules/05-bullmq-worker.mdc` + `.cursor/rules/07-cost-aware.mdc`
 
 ```
-为 vid-maker 创建 storyboard 分镜图生成 Worker。
+为 vid-maker 创建 storyboard 分镜图生成 Worker（使用 Provider 抽象层）。
 
 apps/worker/src/jobs/storyboard.worker.ts：
 
 processStoryboardJob(job: Job<StoryboardJobData>)：
 
 1. 在 DB 创建 generation_job 记录（type:'storyboard', status:'running'）
-2. 分批并行调用 Replicate FLUX.1 Kontext Pro（每批 10 张）：
-   - model: "black-forest-labs/flux-kontext-pro"
-   - input: { prompt: scene.visual_prompt, aspect_ratio: spec.aspect_ratio, output_format: "webp", output_quality: 90 }
-   - 加 tenacity 重试（3次，指数退避 2s-15s）
-3. 每张图完成后（不等全部完成）：
-   a. 更新 DB：scenes.image_url = imageUrl
-   b. 计算成本：0.04 美元 × 7.2 = 0.288 元 = 288 分
-   c. 更新 DB：generation_jobs.ai_cost_cny += 288
-   d. Redis PUBLISH storyboard:{projectId} { sceneId, imageUrl, totalDone, totalScenes }
-4. 全部完成：
-   a. Redis PUBLISH storyboard:{projectId} { type:'complete' }
-   b. DB 更新 projects.status = 'storyboard_done'
+2. 从工厂获取 imageProvider（读环境变量，默认 flux2pro）
+3. 构建 prompt：visual_prompt + 专业参数（shot_type/lighting/composition/color_tone）
+4. 分批并行生成（每批 10 张）：
+   imageProvider.generate(enrichedPrompt, spec)
+5. 每张图完成后：
+   a. 写入 scene_assets 表（新建资产记录，isSelected=true 如果是第一张）
+   b. 更新 scenes.selected_image_id
+   c. 写入 generation_jobs（provider 字段记录使用的 Provider 名称）
+   d. Redis PUBLISH storyboard:{projectId} { sceneId, imageUrl, assetId, totalDone, totalScenes }
+6. 全部完成：更新 projects.status = 'storyboard_done'
 
-Worker 配置：
-const storyboardWorker = new Worker('storyboard', processStoryboardJob, {
-  connection: redisConnection,
-  concurrency: 10
-})
+成本参考（FLUX 2 Pro）：$0.03 × 7.2 = 216 分/张
 
-storyboardWorker.on('failed', async (job, err) => {
-  logger.error('storyboard.job.failed', { jobId: job?.id, error: err.message })
-  if (job && job.attemptsMade >= (job.opts.attempts ?? 1)) {
-    await refundCredits(job.data.user_id, job.data.credit_cost, job.data.project_id)
-    await updateProjectStatus(job.data.project_id, 'failed')
+Worker 配置：concurrency: 10，failed 事件退积分 + status='failed'
+
+无 REPLICATE_API_TOKEN 时：MockProvider 返回 placeholder 图，不报错。
+```
+
+---
+
+### Step 3.3 — 生产 Worker（MiniMax TTS + Kling 3.0 + FFmpeg）
+
+> 发送前打开：`.cursor/rules/07-cost-aware.mdc` + `docs/architecture.md`（第七节）
+
+```
+为 vid-maker 创建视频生产 Worker（使用 Provider 抽象层，新模型版本）。
+
+apps/worker/src/jobs/produce.worker.ts：
+
+processProduceJob(job: Job<ProduceJobData>)：
+
+阶段一：TTS（MiniMax Speech-02，主）
+- ttsProvider = providerFactory.getTts()
+- 逐场景调用 ttsProvider.synthesize(scene.narration, spec.voice_id)
+- 保存 audio 文件到临时目录
+- 写入 generation_jobs（type:'tts'，provider:'minimax'）
+
+阶段二：视频生成（Kling 3.0，主）
+- videoProvider = providerFactory.getVideo()
+- 从 scenes.selected_image_id 获取已选定的最优图片 URL
+- 调用 videoProvider.generate(imageUrl, scene.visual_prompt, scene.duration_sec, scene.camera_motion)
+- Kling 3.0 通过 fal.ai 轮询（间隔 10s，最大 10 分钟）
+- 写入 scene_assets（type:'video'，isSelected:true）
+- 写入 generation_jobs（type:'video'，provider:'kling'）
+
+阶段三：FFmpeg 合成
+- child_process.execFile('ffmpeg', concat + audio overlay)
+- 写入 generation_jobs（type:'assemble'）
+
+阶段四：字幕生成（Faster-Whisper local）
+- 触发 subtitle.job.ts（独立 BullMQ Job）
+- 不等待字幕完成，主流程继续
+
+阶段五：上传 OSS + 收尾
+- 上传 output.mp4 到阿里云 OSS
+- 更新 projects.final_video_url + status = 'done'
+
+subtitle.job.ts（独立 Job）：
+- 对 TTS 音频执行 Faster-Whisper forced alignment（本地 large-v3）
+- 生成精确时间轴 SRT 文件
+- 上传 SRT 到 OSS
+- 更新 projects.subtitle_url
+
+Worker 配置：concurrency: 5，failed 事件退积分 + status='failed'
+
+无 API Key 时（dev mock）：各阶段返回假资源，不阻塞流程。
+```
+
+---
+
+### Step 3.4 — 视频分析 Worker（视频导入模式）
+
+> 发送前打开：`docs/architecture.md`（第十节 10.1）
+
+```
+为 vid-maker 创建视频导入分析 Worker（新增第 4 种输入模式）。
+
+apps/worker/src/jobs/analyze.worker.ts：
+
+processAnalyzeJob(job: Job<AnalyzeJobData>)：
+输入：{ project_id, user_id, source_video_url, spec }
+
+1. 从 OSS 下载用户上传的视频到临时目录
+
+2. FFmpeg 均匀抽帧：
+   frame_count = spec.scene_count（由 duration_preset 决定）
+   interval = video_duration / frame_count
+   ffmpeg -i input.mp4 -vf fps=1/{interval} frames/%04d.jpg
+
+3. Faster-Whisper ASR（本地）：
+   - 提取音频：ffmpeg -i input.mp4 -vn audio.wav
+   - 转写：faster_whisper.transcribe(audio.wav, model='large-v3')
+   - 按场景时间段切割旁白文本
+
+4. Claude 3.5 Sonnet Vision 帧分析：
+   - 逐帧发送给 Claude Vision API
+   - 每帧返回：{ description, shot_type, lighting, composition, color_tone }
+   - 使用 ANTHROPIC_API_KEY（与脚本生成共用）
+
+5. 合并生成 scenes 数组：
+   - narration：从 ASR 切割的对应时段文本
+   - visual_prompt：Claude Vision 生成的画面描述（英文）
+   - shot_type / lighting / composition / color_tone：Vision 分析结果
+   - camera_motion：从 Claude 描述推断
+
+6. 批量写入 scenes 表，更新 projects.status = 'draft'
+
+7. 写入 generation_jobs（type:'analyze'）
+
+AnalyzeJobData schema：
+{ project_id, user_id, credit_cost, source_video_url, spec }
+
+Worker 配置：concurrency: 3（视频分析 CPU 密集），failed 退积分
+
+无 ANTHROPIC_API_KEY 时：跳过 Vision，只用 ASR 生成 narration，visual_prompt 填默认值。
+```
   }
 })
 
@@ -576,19 +763,24 @@ apps/web/src/components/CostConfirmDialog/CostConfirmDialog.tsx：
 - 积分不足时禁用确认按钮 + 显示充值引导
 
 apps/web/src/app/projects/new/page.tsx（Step 1 - 输入）：
-- shadcn Tabs 切换：提示词 / 文案 / 大纲
+- shadcn Tabs 切换：提示词 / 文案 / 大纲 / 视频导入（4个 Tab）
   · 提示词：Textarea（1句话描述视频）
   · 文案：Textarea（完整文案，max 2000字）
   · 大纲：Textarea（每行一个场景要点）
+  · 视频导入（新增）：
+    - 文件上传区域（drag & drop + click），接受 mp4/mov/avi/mkv
+    - 上传到 OSS，获取 source_video_url
+    - 显示视频时长和分辨率（FFprobe 分析结果）
+    - 说明：AI 将自动分析视频内容生成分镜
 - 规格选择（shadcn RadioGroup 或 Button Group）：
   · 时长：30s / 1min / 2min / 5min
   · 比例：16:9 / 9:16 / 1:1
   · 风格：电影感 / 动漫 / 纪录片 / 科技感
-- 底部：预估积分消耗（实时计算，使用 estimateCreditCost）+ "生成脚本"按钮
+- 底部：预估积分消耗（实时计算，使用 estimateCreditCost）+ "生成脚本 / 开始分析"按钮
 - 点击按钮逻辑：
   1. 积分不足 → 弹 CostConfirmDialog
   2. 成本 > 50积分 → 弹 CostConfirmDialog
-  3. 确认 → 调用 createProject → 跳转 /projects/{id}/step2
+  3. 确认 → 调用 createProject（视频导入模式传 source_video_url）→ 跳转 /projects/{id}/step2
 
 apps/web/src/app/projects/[id]/layout.tsx：
 - 5步进度条（Step 1-5），根据 project.status 高亮当前步
@@ -610,7 +802,15 @@ apps/web/src/app/projects/[id]/step3/page.tsx（Step 3 - 分镜审核）：
 - SceneSlot 组件（完全按 sse-progress-ui SKILL.md 实现）：
   · undefined imageUrl → 骨架屏（bg-muted animate-pulse）
   · 有 imageUrl → 渐入动效（animate-in fade-in duration-500）
-  · hover 显示：↺ 重新生成 + ⬆ 上传替换
+  · hover 显示操作菜单（4个）：
+    - ↺ 重新生成（再生成一张，保留历史版本）
+    - 📋 查看所有版本（展开 AssetSelector）
+    - ⬆ 上传替换（本地图片）
+    - 🎨 查看专业参数（shot_type/lighting 等）
+- AssetSelector 组件（新增，多版本对比）：
+  · 横向滚动展示该场景所有历史生成版本
+  · 点击版本卡片 → PATCH 更新 selected_image_id
+  · 当前选中版本右上角显示"✓ 已选"badge
 - 顶部：Progress 进度条 + "X/Y 已完成"
 - dnd-kit SortableContext：拖拽排序（排序后 PATCH 保存）
 - 底部：[← 返回修改脚本] [确认画面 → 开始生产]（可在生成完成前提前点击）
@@ -620,52 +820,57 @@ apps/web/src/app/projects/[id]/step3/page.tsx（Step 3 - 分镜审核）：
 
 ---
 
-### Step 4.3 — Step 4-5 + 积分充值页面
+### Step 4.3 — Step 4-5 + 积分充值 + 多格式导出
 
-> 发送前打开：`.agents/skills/saas-billing-ui/SKILL.md`
+> 发送前打开：`.agents/skills/saas-billing-ui/SKILL.md` + `docs/architecture.md`（第十节 10.4/10.5）
 
 ```
-为 vid-maker 实现向导第 4-5 步和积分充值页面。
+为 vid-maker 实现向导第 4-5 步、积分充值页面和多格式导出功能。
 
 apps/web/src/components/CreditBalance/CreditBalance.tsx：
-- 完全按照 saas-billing-ui SKILL.md "积分余额展示（导航栏）"实现
+- 按 saas-billing-ui SKILL.md "积分余额展示（导航栏）"实现
 - SWR 轮询 /api/billing/balance（refreshInterval: 30000）
 - 余额 < 20 积分：橙色警告 + "充值"链接
 
 apps/web/src/app/projects/[id]/step4/page.tsx（Step 4 - 生产进度）：
-- 轮询 GET /api/projects/:id（每 5s，使用 SWR refreshInterval）
-- 进度展示：
-  · TTS 旁白录制中... / ✅ 完成
-  · Kling 视频生成中... / ✅ 完成
+- 轮询 GET /api/projects/:id（每 5s，SWR refreshInterval）
+- 进度展示（MiniMax TTS → Kling 3.0 → FFmpeg → 字幕生成）：
+  · MiniMax TTS 配音生成中... / ✅ 完成
+  · Kling 3.0 视频生成中... / ✅ 完成（显示已完成 X/N 个场景）
   · 视频合成中... / ✅ 完成
+  · 字幕生成中... / ✅ 完成（可选，后台进行）
 - status = 'done' → 自动跳转 step5
 - status = 'failed' → 显示错误 + "积分已退还" + 重试按钮
-- Notification API：页面可见时不推通知；用户离开时 Notification.requestPermission + new Notification('视频生成完成')
+- Notification API：离开页面时请求桌面通知权限，完成后推送
 
-apps/web/src/app/projects/[id]/step5/page.tsx（Step 5 - 下载）：
-- HTML5 video 预览（controls，src=final_video_url）
-- 下载按钮（a href download）
-- 本次生成成本：来自 project.total_cost_cny
-- 操作按钮：
-  · "再做一个" → /projects/new
-  · "基于此创建变体" → /projects/new?parent={id}
+apps/web/src/app/projects/[id]/step5/page.tsx（Step 5 - 下载与导出）：
+- HTML5 video 预览（src=final_video_url）
+- 多格式导出（4个按钮）：
+  1. 下载 MP4（直接 a href download）
+  2. 下载剪映草稿 → GET /api/projects/:id/export/jianying（自动下载 .json）
+  3. 下载 SRT 字幕 → GET /api/projects/:id/export/srt（project.subtitle_url 不为空时显示）
+  4. 下载分镜 JSON → GET /api/projects/:id/export/json（结构化场景数据）
+- 本次生成成本：project.total_cost_cny / 100 元
+- 操作：[再做一个] [基于此创建变体]
+
+API 新增（apps/api/src/routes/export.ts）：
+GET /api/projects/:id/export/jianying → 返回剪映 draft JSON，Content-Disposition: attachment
+GET /api/projects/:id/export/srt     → 重定向到 project.subtitle_url
+GET /api/projects/:id/export/json    → 返回结构化分镜 JSON
+
+剪映 draft JSON 格式要点：
+- version: "13.0.0"（当前剪映版本）
+- materials.videos：每个场景的视频素材
+- tracks：视频轨道 + 音频轨道 + 字幕轨道
+- 时间单位：微秒（duration_sec × 1000000）
 
 apps/web/src/app/billing/page.tsx（积分充值）：
-按 saas-billing-ui SKILL.md 实现三个部分：
+按 saas-billing-ui SKILL.md 实现：
 
-1. 当前余额卡片（余额 + 当前套餐 + 到期时间）
-
-2. 积分充值包（3档，推荐标记标准包）：
-   - ¥49 → 50积分（基础包）
-   - ¥129 → 150积分（标准包，"最划算" badge）
-   - ¥279 → 350积分（专业包）
-   - 点击"立即购买"→ Toast "支付功能即将上线，请联系客服"（MVP 阶段）
-
-3. 订阅套餐对比卡片（3列）：
-   - 免费版：¥0 / 10积分/月 / 仅30s视频
-   - 基础版：¥99 / 60积分/月 / 全规格 / 优先队列
-   - 专业版：¥299 / 200积分/月 / 最高优先级 / 专属客服
-   - 当前套餐高亮，其他显示"升级"按钮（同上 Toast）
+1. 当前余额 + 套餐状态
+2. 充值包（3档）：¥49→50积分 / ¥129→150积分（推荐）/ ¥299→400积分
+3. 订阅对比（3列）：免费¥0/基础¥99/专业¥299
+   - 当前套餐高亮，MVP 阶段支付按钮 → Toast "即将上线"
 ```
 
 ---

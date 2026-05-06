@@ -1,5 +1,5 @@
 # AGENTS.md — vid-maker v2
-> 版本：v1.0 · 2026-05 · vid-maker SaaS 项目
+> 版本：v1.1 · 2026-05 · vid-maker SaaS 项目
 
 ---
 
@@ -34,19 +34,31 @@ vid-maker/
 
 ## [Tech Stack]
 
-| 层级 | 选型 | 版本 | 说明 |
-|------|------|------|------|
-| API Server | Hono.js | Node.js 22 | 轻量 TypeScript-first，支持原生 SSE |
-| 任务队列 | BullMQ + Redis | — | 视频生成异步化，Worker 独立扩容 |
-| 数据库 | PostgreSQL + Drizzle ORM | — | 多租户就绪，类型安全迁移 |
-| 前端 | Next.js 15 + React 19 | TypeScript | App Router，shadcn/ui + dnd-kit |
-| 共享类型 | Zod | — | packages/shared，前后端共用 |
-| 文件存储 | 阿里云 OSS | S3 兼容 | 视频/图片 CDN 分发 |
-| 认证 | Better Auth | — | 手机号 OTP + 微信 OAuth |
-| 支付 | 微信支付 + 支付宝 | — | 国内主流支付 |
-| 内容审核 | 阿里云内容安全 | — | 图片+文本生成前前置过滤 |
-| 包管理 | pnpm workspaces | — | Monorepo 统一管理 |
-| RAG 记忆 | project-memory-rag | v1.0 | MCP Server，自动捕获开发经验 |
+### 基础设施
+
+| 层级 | 选型 | 说明 |
+|------|------|------|
+| API Server | Hono.js + Node.js 22 | 轻量 TypeScript-first，原生 SSE |
+| 任务队列 | BullMQ + Redis | Worker 独立扩容，死信队列，优先级 |
+| 数据库 | PostgreSQL + Drizzle ORM | 多租户就绪，类型安全迁移 |
+| 前端 | Next.js 15 + React 19 | App Router，shadcn/ui + dnd-kit |
+| 共享类型 | Zod（packages/shared）| 前后端共用，运行时校验 |
+| 文件存储 | 阿里云 OSS | S3 兼容，CDN 分发 |
+| 认证 | Better Auth | 手机号 OTP + 微信 OAuth |
+| 支付 | 微信支付 + 支付宝 | 国内主流 |
+| 内容审核 | 阿里云内容安全 | 生成前前置过滤 |
+| RAG 记忆 | project-memory-rag v1.0 | MCP Server，自动捕获开发经验 |
+
+### AI 模型（效果优先，基于 2026 Benchmark）
+
+| 环节 | 主选 | 备选 | 关键指标 |
+|------|------|------|---------|
+| 脚本生成 | Claude Sonnet 4.6 | Claude Haiku 4.5 | JSON 合规 98%+，最佳结构化输出 |
+| 图片生成 | FLUX 2 Pro（Replicate）| Ideogram v3 | $0.03/张，真实感领先，6s 生成 |
+| 视频生成 | Kling 3.0（fal.ai）| Runway Gen-4 | 原生 4K + 内置音频，$0.112/秒 |
+| TTS 配音 | MiniMax Speech-02 | ElevenLabs v3 | 全球 TTS Arena #1，中文 WER 2.252% |
+| ASR 转写 | Faster-Whisper large-v3（本地）| OpenAI Whisper-1 API | WER 1.5%，零 API 成本 |
+| 视频理解 | Claude 3.5 Sonnet Vision | — | 共用 Anthropic Key |
 
 ---
 
@@ -54,10 +66,11 @@ vid-maker/
 
 | 路径 | 职责 | 关键文件 |
 |------|------|---------|
-| `apps/api/src/routes/` | HTTP 路由，状态机转换触发点 | `projects.ts` / `sse.ts` / `billing.ts` |
-| `apps/worker/src/jobs/` | 异步任务执行（图片/音频/视频生成）| `storyboard.job.ts` / `produce.job.ts` |
+| `apps/api/src/routes/` | HTTP 路由，状态机转换触发点 | `projects.ts` / `sse.ts` / `billing.ts` / `export.ts` |
+| `apps/worker/src/jobs/` | 异步任务执行 | `analyze.job.ts` / `storyboard.job.ts` / `produce.job.ts` / `subtitle.job.ts` |
+| `apps/worker/src/providers/` | AI Provider 抽象层（可插拔）| `image/flux2pro.ts` / `video/kling.ts` / `tts/minimax.ts` |
 | `apps/web/src/app/projects/` | 5 步向导前端页面 | `step1/` ~ `step5/` |
-| `packages/db/src/schema/` | Drizzle 表定义 | `users.ts` / `projects.ts` / `billing.ts` |
+| `packages/db/src/schema/` | Drizzle 表定义 | `users.ts` / `projects.ts` / `billing.ts` / `scene-assets.ts` |
 | `packages/shared/src/` | 跨包 Zod schemas | `project.schema.ts` / `billing.schema.ts` |
 | `packages/queue/src/` | BullMQ Job 类型定义 | `jobs.ts` / `queues.ts` |
 
