@@ -44,12 +44,14 @@ Phase 5  联调       Step 5.1 E2E 冒烟测试
 
 apps/api/package.json：
 - name: "@vid-maker/api"
-- dependencies: hono @hono/zod-validator bullmq ioredis drizzle-orm pg zod better-auth structlog @anthropic-ai/sdk replicate @elevenlabs/elevenlabs-js
+- dependencies: hono @hono/zod-validator bullmq ioredis drizzle-orm pg zod better-auth structlog @anthropic-ai/sdk
 - devDependencies: @types/node tsx vitest @types/pg
 
 apps/worker/package.json：
 - name: "@vid-maker/worker"
 - dependencies: bullmq ioredis drizzle-orm pg zod @vid-maker/db @vid-maker/queue @vid-maker/shared
+    @anthropic-ai/sdk replicate @fal-ai/client @elevenlabs/elevenlabs-js faster-whisper-nodejs ali-oss
+    （注：Faster-Whisper 通过 Python subprocess 或 faster-whisper-nodejs 调用，具体在 Step 3.1 决定）
 
 apps/web/package.json：
 - name: "@vid-maker/web"
@@ -247,7 +249,7 @@ packages/queue/package.json：
    - ProduceJobSchema = z.object({ project_id, user_id, credit_cost, scenes, spec, storyboard_urls })
    - 导出 ProduceJobData = z.infer<typeof ProduceJobSchema>
 
-4. queues.ts：
+5. queues.ts：
    - storyboardQueue = new Queue('storyboard', { connection, defaultJobOptions: {
        attempts: 3,
        backoff: { type: 'exponential', delay: 5000 },
@@ -261,7 +263,7 @@ packages/queue/package.json：
        removeOnFail: false
      }})
 
-5. index.ts：统一导出
+6. index.ts：统一导出
 
 要求：
 - Job schema 必须包含 credit_cost 字段（用于失败时退积分）
@@ -421,7 +423,7 @@ GET /api/projects/:id/storyboard-progress（需要 authMiddleware）
 逻辑：
 1. 查询项目，验证 userId，404 找不到
 2. 若 status 已是 storyboard_done / producing / done：
-   - 读取所有 scenes 的 image_url，逐条推送 scene-done 事件
+   - 查询所有 scenes 关联的 selected scene_assets（type='image', isSelected=true），逐条推送 scene-done 事件
    - 最后推送 complete 事件，关闭连接
 3. 否则：
    - 用 streamSSE 创建 SSE 流
@@ -638,65 +640,6 @@ AnalyzeJobData schema：
 Worker 配置：concurrency: 3（视频分析 CPU 密集），failed 退积分
 
 无 ANTHROPIC_API_KEY 时：跳过 Vision，只用 ASR 生成 narration，visual_prompt 填默认值。
-```
-  }
-})
-
-无 REPLICATE_API_TOKEN 时（dev 环境）：返回固定 placeholder 图片 URL，不调用真实 API。
-
-要求：
-- 每张图成本写入独立的 generation_job 行（不合并到一条）
-- 退积分必须幂等（refundCredits 函数已有此保证）
-```
-
----
-
-### Step 3.2 — 生产 Worker（TTS + Kling + FFmpeg）
-
-> 发送前打开：`.cursor/rules/07-cost-aware.mdc` + `docs/architecture.md`（第七节 BullMQ 设计）
-
-```
-为 vid-maker 创建视频生产 Worker。
-
-apps/worker/src/jobs/produce.worker.ts：
-
-processProduceJob(job: Job<ProduceJobData>)：
-
-阶段一：TTS（ElevenLabs）
-- 逐场景调用 ElevenLabs v2（voice_id 来自 spec）
-- SDK: @elevenlabs/elevenlabs-js，接口: textToSpeech.convert
-- 保存音频到 /tmp/vid-{projectId}/audio/scene-{id}.mp3
-- 成本：narration.length × 0.00018 × 7.2，写入 generation_jobs(type:'tts')
-
-阶段二：视频生成（Kling）
-- 调用 Kling v2.6-pro API（POST https://api.klingai.com/v1/videos/image2video）
-- 参数：image_url=scene.image_url, camera_control=scene.camera_motion, duration=5
-- 轮询任务状态（GET /v1/videos/{taskId}）：间隔 10s，最大 10 分钟
-- 成本：5秒 × $0.05 × 7.2 = 1.8 元 = 180 分，写入 generation_jobs(type:'video')
-
-阶段三：FFmpeg 合成
-- 生成 concat.txt（ffmpeg 拼接列表文件）
-- child_process.execFile('ffmpeg', [
-    '-f', 'concat', '-safe', '0', '-i', 'concat.txt',
-    '-c:v', 'copy', '-c:a', 'aac', '-movflags', '+faststart',
-    'output.mp4'
-  ], { cwd: tmpDir })
-- 写入 generation_jobs(type:'assemble'，cost:0)
-
-阶段四：上传 OSS + 收尾
-- 上传 output.mp4 到阿里云 OSS（使用 ali-oss SDK）
-- key: videos/{projectId}/final.mp4
-- 更新 projects.final_video_url = CDN_URL + key
-- 更新 projects.status = 'done'
-- 累加 projects.total_cost_cny（所有 generation_jobs 之和）
-- 删除 /tmp/vid-{projectId}/ 临时文件
-
-Worker 配置：concurrency: 5，failed 事件退积分 + status='failed'
-
-无真实 API Key 时（dev mock）：
-- TTS → 复制一段静音 mp3
-- Kling → 用 FFmpeg 将分镜图转成 5s 静止视频
-- OSS → 复制到本地 public/ 目录，返回 localhost URL
 ```
 
 ---
