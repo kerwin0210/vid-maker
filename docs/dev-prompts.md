@@ -250,20 +250,24 @@ packages/queue/package.json：
    - 导出 ProduceJobData = z.infer<typeof ProduceJobSchema>
 
 5. queues.ts：
+   - analyzeQueue = new Queue('analyze', { connection, defaultJobOptions: {
+       attempts: 2, backoff: { type: 'fixed', delay: 5000 },
+       removeOnComplete: { count: 50 }, removeOnFail: false
+     }})
    - storyboardQueue = new Queue('storyboard', { connection, defaultJobOptions: {
-       attempts: 3,
-       backoff: { type: 'exponential', delay: 5000 },
-       removeOnComplete: { count: 100 },
-       removeOnFail: false
+       attempts: 3, backoff: { type: 'exponential', delay: 5000 },
+       removeOnComplete: { count: 100 }, removeOnFail: false
      }})
    - produceQueue = new Queue('produce', { connection, defaultJobOptions: {
-       attempts: 2,
-       backoff: { type: 'fixed', delay: 10000 },
-       removeOnComplete: { count: 100 },
-       removeOnFail: false
+       attempts: 2, backoff: { type: 'fixed', delay: 10000 },
+       removeOnComplete: { count: 100 }, removeOnFail: false
+     }})
+   - subtitleQueue = new Queue('subtitle', { connection, defaultJobOptions: {
+       attempts: 3, backoff: { type: 'exponential', delay: 3000 },
+       removeOnComplete: { count: 100 }, removeOnFail: false
      }})
 
-6. index.ts：统一导出
+6. index.ts：统一导出所有 Queue 和 JobData 类型
 
 要求：
 - Job schema 必须包含 credit_cost 字段（用于失败时退积分）
@@ -373,13 +377,20 @@ packages/queue/package.json：
 apps/api/src/routes/projects.ts（全部需要 authMiddleware）：
 
 POST /api/projects（接受 CreateProjectSchema）：
-1. moderateText(rawInput)（内容安全审核）
+1. moderateText(rawInput)（内容安全审核，视频导入模式跳过）
 2. 估算积分消耗：estimateCreditCost(spec)
 3. deductCredits(userId, cost, newProjectId)
-4. 调用 Claude Sonnet 4.6 生成脚本（system prompt 见 AGENTS.md 中脚本生成要求）
-5. 写入 projects（status:'draft'）和 scenes 表
-6. 写入 generation_jobs（type:'script'，记录 Claude 实际 token 成本）
-7. 返回 { project_id, status, scenes, estimated_cost_cny }
+4. 根据 input_mode 分支：
+   · prompt / article / outline：
+     - 调用 Claude Sonnet 4.6 生成脚本（含 professional_params）
+     - 写入 projects（status:'draft'）+ scenes 表
+     - 写入 generation_jobs（type:'script'）
+   · video（视频导入模式）：
+     - 验证 source_video_url 不为空
+     - 写入 projects（status:'draft'，scenes 暂为空）
+     - analyzeQueue.add('analyze', { project_id, user_id, credit_cost, source_video_url, spec })
+     - 立即返回（前端轮询等待 scenes 生成）
+5. 返回 { project_id, status, input_mode, scenes: [], estimated_cost_cny }
 
 GET /api/projects → 用户项目列表（分页，最新在前）
 GET /api/projects/:id → 项目详情（含 scenes）
@@ -399,12 +410,32 @@ POST /api/projects/:id/approve-storyboard：
 - produceQueue.add('produce', { ... })
 
 POST /api/projects/:id/scenes/:sceneId/regenerate：
-- 单场景重新生成图片（调用 FLUX.1，更新 scenes.image_url）
+- 通过 imageProvider（FLUX 2 Pro）重新生成一张图片
+- 写入 scene_assets 新记录（isSelected=false，不自动覆盖旧选择）
+- 返回新 asset 信息，前端展示多版本供用户选择
+
+PATCH /api/projects/:id/scenes/:sceneId/select-asset：
+- body: { assetId: string }
+- 将指定 asset 的 isSelected 设为 true，同组其他 asset 设为 false
+- 更新 scenes.selected_image_id
+
+新增导出路由（apps/api/src/routes/export.ts）：
+GET /api/projects/:id/export/jianying：
+- 生成剪映 draft JSON（参考 architecture.md 第十节 10.5）
+- Content-Disposition: attachment; filename="project-{id}.json"
+
+GET /api/projects/:id/export/srt：
+- 返回 302 重定向到 project.subtitle_url（OSS CDN）
+- subtitle_url 为空时返回 404
+
+GET /api/projects/:id/export/json：
+- 返回结构化分镜 JSON（scenes + professional_params）
 
 要求：
 - 所有 DB 查询 WHERE 必须包含 AND user_id = userId
 - 状态转换错误返回 409 Conflict（不是 400）
 - Claude 成本：(inputTokens * 0.000003 + outputTokens * 0.000015) * 7.2，单位转为"分"写入 DB
+- export 路由必须验证 project.status === 'done'（未完成不允许导出）
 ```
 
 ---
@@ -668,12 +699,24 @@ Worker 配置：concurrency: 3（视频分析 CPU 密集），failed 退积分
 
 5. apps/web/src/lib/api.ts：
    封装所有 API 调用，每个函数返回类型化结果：
+   // 项目核心流程
    - createProject(input: CreateProjectInput): Promise<{ project_id, status, scenes, estimated_cost_cny }>
    - getProject(id: string): Promise<Project>
    - patchScript(id, scenes): Promise<void>
    - approveScript(id): Promise<void>
    - approveStoryboard(id): Promise<void>
+   // 视频导入模式
+   - uploadSourceVideo(file: File): Promise<{ url: string, duration: number, resolution: string }>
+   // 分镜多版本
+   - regenerateSceneImage(projectId, sceneId): Promise<SceneAsset>
+   - getSceneAssets(projectId, sceneId): Promise<SceneAsset[]>
+   - selectSceneAsset(projectId, sceneId, assetId): Promise<void>
+   // 积分
    - getBalance(): Promise<{ balance: number, plan: string }>
+   // 导出
+   - exportJianying(projectId: string): void  // 触发文件下载
+   - exportSrt(projectId: string): void        // 触发文件下载
+   - exportJson(projectId: string): void       // 触发文件下载
 
 6. apps/web/src/hooks/useStoryboardProgress.ts：
    完全按照 .agents/skills/sse-progress-ui/SKILL.md 实现：
@@ -839,7 +882,7 @@ b. 创建项目：POST /api/projects（mock userId 模式）
    预期：status=201, project_id, scenes.length=5
 c. 审核脚本：POST /api/projects/{id}/approve-script → status=202
 d. SSE 进度：连接 /api/projects/{id}/storyboard-progress，等待 complete 事件（超时 3 分钟）
-e. 验证 scenes 全部有 image_url
+e. 验证所有 scenes 都有 selected_image_id（scene_assets 中 isSelected=true 的记录）
 f. 审核分镜：POST /api/projects/{id}/approve-storyboard → status=202
 g. 轮询状态直到 done 或 failed（超时 15 分钟，每 10s 一次）
 h. 断言 final_video_url 可访问（HEAD 请求 200）
