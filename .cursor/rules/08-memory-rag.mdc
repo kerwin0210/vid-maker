@@ -1,0 +1,56 @@
+---
+description: project-memory-rag 使用规范——何时 query、何时 ingest、不需要写的场景。
+alwaysApply: true
+---
+
+# project-memory-rag 使用规范
+
+project-memory-rag 是"给 Agent 自己用的开发记忆"，不是给用户的知识库。
+通过 MCP `project-memory` 服务调用（`query_memory` / `ingest_memory`）。
+
+## 必须调用 query_memory 的场景（任务开始前先查）
+
+遇到以下类型的问题，**先查记忆再动手**：
+
+```
+- 外部 API 报错（Kling / FLUX.1 / ElevenLabs / 微信支付 / 支付宝）
+- BullMQ 队列/并发/死信相关问题
+- PostgreSQL 连接/事务/迁移问题
+- Redis 脚本执行/积分原子操作问题
+- 阿里云 OSS / 内容安全 API 对接问题
+- 任何"之前踩过坑"的感觉
+```
+
+查询示例：
+```
+query_memory("Kling API 超时 rate limit")
+query_memory("BullMQ 死信队列 worker 配置")
+query_memory("积分扣减并发超扣")
+query_memory("微信支付签名验证")
+```
+
+## 必须调用 ingest_memory 的场景（任务完成后写入）
+
+| 场景 | 方法 | 示例 |
+|------|------|------|
+| 修复了外部 API 报错 | `capture_error` | Kling 超时后改用轮询而非长连接 |
+| 做了架构决策 | `capture_adr` | 为什么选 Hono 不选 FastAPI |
+| 完成重大功能模块 | `capture_task_end` | BullMQ Worker 扩容方案上线 |
+| PR 合并重要变更 | `capture_pr` | 积分退款幂等逻辑重构 |
+
+## 不需要写入的场景
+
+- 日常 CRUD 接口开发（增删改查）
+- UI 样式/布局调整
+- 文档注释更新
+- 配置文件格式调整
+
+## 通过 Cursor Hooks 自动触发
+
+`stop` Hook（Agent 每次完成回合）会自动分析响应，
+含以下关键词时自动写入记忆：
+- 错误/报错/exception/修复/fixed → `capture_error`
+- 选择了/决定/ADR → `capture_adr`
+- 完成了/已完成 且响应 > 300 字 → `capture_task_end`
+
+`sessionStart` Hook（打开新会话）会自动展示最近 5 条开发记忆。

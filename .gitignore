@@ -1,0 +1,47 @@
+# 环境变量（禁止提交）
+.env
+.env.local
+.env.*.local
+
+# 支付证书（禁止提交）
+certs/
+
+# 依赖
+node_modules/
+.pnpm-store/
+
+# 构建产物
+dist/
+.next/
+out/
+build/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+
+# project-memory-rag 数据（本地持久化，不提交）
+.project-memory/
+
+# 日志
+*.log
+logs/
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+*.swp
+*.swo
+
+# 测试覆盖率
+coverage/
+.nyc_output/
+
+# Playwright 测试结果
+test-results/
+playwright-report/

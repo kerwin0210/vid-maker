@@ -1,0 +1,37 @@
+---
+description: 绝对禁止事项——无论任何情况任何理由，Agent 都不得执行以下操作。
+alwaysApply: true
+---
+
+# 绝对禁止事项（Never-Do）
+
+## 数据安全红线
+
+- **禁止** 将 API Key、数据库连接字符串、密码、私钥写进代码文件（必须用环境变量）
+- **禁止** 将 `.env` 文件提交到 git（`.env` 必须在 `.gitignore` 中）
+- **禁止** 在日志中打印用户手机号、身份证、银行卡等 PII 字段
+- **禁止** 将含 PII 的数据直接传给 AI API（Claude / FLUX.1 等）
+
+## 破坏性操作红线
+
+- **禁止** 不经确认执行 `DROP TABLE`、`DELETE FROM`（无 WHERE）、`TRUNCATE`
+- **禁止** 不经确认执行 `git push --force` 到 main 分支
+- **禁止** 不经确认删除 `.project-memory/` 目录（会丢失 RAG 记忆）
+- **禁止** 不经确认修改 `package.json` 中已锁定的依赖版本
+
+## 业务逻辑红线
+
+- **禁止** 跳过状态机合法转换路径（如 draft → producing，必须按顺序流转）
+- **禁止** 不经内容安全审核直接调用 FLUX.1 / Claude 生成内容
+- **禁止** 直接 `DECR` 积分（必须用 Redis Lua 原子脚本防超扣）
+- **禁止** 在 Worker Job 失败时不触发退积分逻辑
+
+## 代码质量红线
+
+- **禁止** 提交占位代码：`// TODO: implement`、`throw new Error('not implemented')`、空函数体
+- **禁止** 使用 `any` 类型（必须明确 Zod schema 或 TypeScript 类型）
+- **禁止** 在没有验证 import 存在的情况下假设某个包/函数存在
+
+## 遇到禁止操作时
+
+说明：1）这是 Never-Do 规则禁止的操作；2）提供替代方案。

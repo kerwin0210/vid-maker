@@ -1,0 +1,79 @@
+---
+description: Drizzle ORM 规范——Schema 定义、事务写法、禁止裸 SQL、迁移流程。
+globs: ["packages/db/**/*.ts", "apps/api/**/*.ts", "apps/worker/**/*.ts"]
+alwaysApply: false
+---
+
+# Drizzle ORM 规范
+
+## Schema 定义规范
+
+```typescript
+// packages/db/src/schema/projects.ts
+import { pgTable, uuid, text, timestamp, integer, pgEnum } from 'drizzle-orm/pg-core'
+
+export const projectStatusEnum = pgEnum('project_status', [
+  'draft', 'script_approved', 'storyboard_done', 'producing', 'done', 'failed'
+])
+
+export const projects = pgTable('projects', {
+  id:           uuid('id').primaryKey().defaultRandom(),
+  userId:       uuid('user_id').notNull().references(() => users.id, { onDelete: 'cascade' }),
+  status:       projectStatusEnum('status').notNull().default('draft'),
+  rawInput:     text('raw_input').notNull(),
+  specJson:     text('spec_json').notNull(),        // VideoSpec JSON
+  totalCostCny: integer('total_cost_cny').notNull().default(0), // 单位：分
+  createdAt:    timestamp('created_at').notNull().defaultNow(),
+  updatedAt:    timestamp('updated_at').notNull().defaultNow(),
+})
+```
+
+## 查询规范
+
+```typescript
+// ✅ 必须带 userId 条件（用户隔离）
+const project = await db.query.projects.findFirst({
+  where: and(
+    eq(projects.id, projectId),
+    eq(projects.userId, userId)
+  ),
+  with: { scenes: true }
+})
+
+// ✅ 更新状态必须同时更新 updatedAt
+await db.update(projects)
+  .set({ status: 'script_approved', updatedAt: new Date() })
+  .where(and(eq(projects.id, projectId), eq(projects.userId, userId)))
+
+// ❌ 禁止裸 SQL（sql`` 模板只在无法用 ORM 表达时使用，且需注释说明原因）
+```
+
+## 事务写法
+
+```typescript
+// ✅ 积分扣减 + 项目创建必须在同一事务
+await db.transaction(async (tx) => {
+  // 1. 扣减积分
+  await tx.update(users)
+    .set({ creditBalance: sql`${users.creditBalance} - ${cost}` })
+    .where(and(eq(users.id, userId), gte(users.creditBalance, cost)))
+  // 2. 记录流水
+  await tx.insert(creditTransactions).values({ userId, delta: -cost, type: 'consume', refId: projectId })
+  // 3. 创建项目
+  await tx.insert(projects).values({ id: projectId, userId, ... })
+})
+```
+
+## 迁移流程
+
+```bash
+# 1. 修改 schema 后生成迁移文件
+pnpm --filter @vid-maker/db drizzle-kit generate
+
+# 2. 审查生成的 SQL 文件（在 packages/db/migrations/）
+# 3. 应用迁移
+pnpm --filter @vid-maker/db drizzle-kit migrate
+
+# ❌ 禁止手动修改已应用的迁移文件
+# ❌ 禁止在生产环境直接 push schema（必须走迁移）
+```

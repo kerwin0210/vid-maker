@@ -1,0 +1,75 @@
+---
+description: AI API 成本归因规范——每次调用必须写入 generation_jobs 成本字段。
+globs: ["apps/worker/**/*.ts", "apps/api/**/*.ts"]
+alwaysApply: false
+---
+
+# AI API 成本归因规范
+
+## 核心原则
+
+每次调用外部 AI API（Claude / FLUX.1 / ElevenLabs / Kling）后，**必须立即**将实际成本写入 `generation_jobs` 表，不得只在内存中累计。
+
+## 各 API 成本计算
+
+```typescript
+// apps/worker/src/lib/cost-calculator.ts
+const CNY_PER_USD = 7.2  // 定期更新汇率
+
+export const CostCalculator = {
+  claude: (inputTokens: number, outputTokens: number) =>
+    ((inputTokens * 0.000003 + outputTokens * 0.000015) * CNY_PER_USD),
+
+  flux1: () => 0.04 * CNY_PER_USD,         // $0.04/张
+
+  elevenLabs: (chars: number) =>
+    (chars * 0.00018 * CNY_PER_USD),        // $0.00018/字符
+
+  kling: (durationSec: number) =>
+    (durationSec * 0.05 * CNY_PER_USD),     // $0.05/秒（Pro）
+}
+```
+
+## 写入模板（每个 Job 必须实现）
+
+```typescript
+async function processStoryboardJob(job: Job<StoryboardJobData>) {
+  const jobRecord = await db.insert(generationJobs).values({
+    projectId: job.data.projectId,
+    type: 'storyboard',
+    status: 'running',
+    startedAt: new Date(),
+  }).returning().then(r => r[0])
+
+  try {
+    const [imageUrl] = await flux1.generate(scene.visualPrompt)
+    const cost = CostCalculator.flux1()
+
+    // ✅ 每张图完成立即写入成本
+    await db.update(generationJobs)
+      .set({ aiCostCny: Math.round(cost * 100), status: 'done', finishedAt: new Date() })
+      .where(eq(generationJobs.id, jobRecord.id))
+
+    // ✅ 累加到项目总成本
+    await db.update(projects)
+      .set({ totalCostCny: sql`${projects.totalCostCny} + ${Math.round(cost * 100)}` })
+      .where(eq(projects.id, job.data.projectId))
+  } catch (err) {
+    await db.update(generationJobs)
+      .set({ status: 'failed', finishedAt: new Date() })
+      .where(eq(generationJobs.id, jobRecord.id))
+    throw err
+  }
+}
+```
+
+## 毛利率监控告警
+
+```typescript
+// 当某个项目的实际成本 > 估算成本 × 1.5 时，发告警
+const COST_OVERRUN_THRESHOLD = 1.5
+
+if (actualCostCny > estimatedCostCny * COST_OVERRUN_THRESHOLD) {
+  await alertOps(`项目 ${projectId} 成本超支：估算 ¥${estimatedCostCny/100}，实际 ¥${actualCostCny/100}`)
+}
+```

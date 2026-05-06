@@ -1,0 +1,101 @@
+---
+description: Next.js 15 App Router 规范——Server vs Client Component 判断、SSE 接入、shadcn/ui 使用。
+globs: ["apps/web/**/*.tsx", "apps/web/**/*.ts", "apps/admin/**/*.tsx"]
+alwaysApply: false
+---
+
+# Next.js 15 App Router 规范
+
+## Server vs Client Component 判断
+
+```
+有交互（onClick / onChange / useState / useEffect）→ Client Component（'use client'）
+仅展示数据、无事件监听                             → Server Component（默认，不加 'use client'）
+有异步数据获取                                     → async Server Component + Suspense
+需要浏览器 API（localStorage / window）            → 必须是 Client Component
+```
+
+```tsx
+// ✅ Server Component（默认，无 'use client'）
+export default async function ProjectPage({ params }: { params: { id: string } }) {
+  const project = await getProject(params.id) // 直接 await，无 useEffect
+  return <ScriptReview project={project} />
+}
+
+// ✅ Client Component（有交互）
+'use client'
+export function ScriptEditor({ scenes, onSave }: Props) {
+  const [editing, setEditing] = useState(false)
+  // ...
+}
+```
+
+## SSE 进度接收（分镜生成）
+
+```tsx
+// ✅ 使用自定义 hook 接收 SSE
+'use client'
+export function useStoryboardProgress(projectId: string) {
+  const [scenes, setScenes] = useState<SceneImage[]>([])
+  const [isComplete, setIsComplete] = useState(false)
+
+  useEffect(() => {
+    const es = new EventSource(`/api/projects/${projectId}/storyboard-progress`)
+    es.addEventListener('scene-done', (e) => {
+      const data = JSON.parse(e.data)
+      setScenes(prev => [...prev, data])
+    })
+    es.addEventListener('complete', () => {
+      setIsComplete(true)
+      es.close()
+    })
+    return () => es.close()
+  }, [projectId])
+
+  return { scenes, isComplete }
+}
+```
+
+## shadcn/ui 使用规范
+
+```tsx
+// ✅ 通过 shadcn CLI 添加组件，不手写复制
+// npx shadcn@latest add button dialog
+
+// ✅ 使用 cn() 合并类名
+import { cn } from '@/lib/utils'
+
+<Button className={cn('w-full', isLoading && 'opacity-50')} disabled={isLoading}>
+  {isLoading ? '生成中...' : '生成脚本'}
+</Button>
+```
+
+## 页面路由结构（5 步向导）
+
+```
+apps/web/src/app/
+├── page.tsx                        # 首页 / 落地页
+├── projects/
+│   └── [id]/
+│       ├── layout.tsx              # 步骤进度条（Server Component）
+│       ├── step1/page.tsx          # 输入 + 规格配置
+│       ├── step2/page.tsx          # 脚本审核（内联编辑）
+│       ├── step3/page.tsx          # 分镜审核（SSE + dnd-kit）
+│       ├── step4/page.tsx          # 生产进度（自动）
+│       └── step5/page.tsx          # 结果下载
+├── billing/page.tsx                # 积分充值 / 订阅套餐
+└── settings/page.tsx               # 账号设置
+```
+
+## 成本警告弹窗（5min 视频必须弹出）
+
+```tsx
+// 超过 ¥50 阈值时弹出确认
+const COST_WARN_THRESHOLD = 50
+
+if (estimatedCost > COST_WARN_THRESHOLD) {
+  // 必须弹 Dialog 让用户确认，不能直接跳过
+  setShowCostWarning(true)
+  return
+}
+```

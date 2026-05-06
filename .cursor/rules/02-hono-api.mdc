@@ -1,0 +1,92 @@
+---
+description: Hono API 设计规范——路由、Zod 校验、错误格式、速率限制。
+globs: ["apps/api/**/*.ts"]
+alwaysApply: false
+---
+
+# Hono API 设计规范
+
+## 路由结构规范
+
+```typescript
+// apps/api/src/routes/projects.ts
+import { Hono } from 'hono'
+import { zValidator } from '@hono/zod-validator'
+import { authMiddleware } from '../middleware/auth'
+import { CreateProjectSchema } from '@vid-maker/shared'
+
+const projects = new Hono()
+
+// ✅ 所有路由必须经过 authMiddleware
+projects.use('*', authMiddleware)
+
+// ✅ 请求体必须用 zValidator 校验
+projects.post('/', zValidator('json', CreateProjectSchema), async (c) => {
+  const input = c.req.valid('json')
+  const userId = c.get('userId') // 从 auth middleware 注入
+  // ...
+})
+```
+
+## 统一错误格式
+
+```typescript
+// 所有错误必须返回此格式
+type ErrorResponse = {
+  error: {
+    code: string      // 机器可读：'CREDIT_INSUFFICIENT' | 'PROJECT_NOT_FOUND' 等
+    message: string   // 人类可读
+    requestId: string // 追踪用
+  }
+}
+
+// ✅ 使用统一错误处理 middleware
+app.onError((err, c) => {
+  if (err instanceof AppError) {
+    return c.json({ error: { code: err.code, message: err.message, requestId: c.get('requestId') } }, err.status)
+  }
+  return c.json({ error: { code: 'INTERNAL_ERROR', message: 'Internal server error', requestId: c.get('requestId') } }, 500)
+})
+```
+
+## 用户隔离（强制要求）
+
+```typescript
+// ✅ 所有涉及用户数据的查询必须带 userId 条件
+const project = await db.query.projects.findFirst({
+  where: and(
+    eq(projects.id, projectId),
+    eq(projects.userId, userId)  // ← 必须！防止越权访问
+  )
+})
+
+// 找不到时统一返回 404（不暴露数据是否存在）
+if (!project) throw new AppError('PROJECT_NOT_FOUND', 'Project not found', { status: 404 })
+```
+
+## SSE 规范
+
+```typescript
+// ✅ 分镜生成进度推送
+projects.get('/:id/storyboard-progress', async (c) => {
+  const userId = c.get('userId')
+  return streamSSE(c, async (stream) => {
+    const sub = redis.subscribe(`storyboard:${projectId}`, async (msg) => {
+      await stream.writeSSE({ data: msg, event: 'scene-done' })
+    })
+    // 清理订阅
+    c.req.raw.signal.addEventListener('abort', () => sub.unsubscribe())
+  })
+})
+```
+
+## 速率限制
+
+```typescript
+// ✅ 生成接口必须加速率限制
+import { rateLimiter } from '../middleware/rate-limit'
+
+// 免费用户：每小时 2 次生成
+// Pro 用户：每小时 20 次生成
+projects.post('/', rateLimiter({ free: 2, pro: 20, window: '1h' }), ...)
+```

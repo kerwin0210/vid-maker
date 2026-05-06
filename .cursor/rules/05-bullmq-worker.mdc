@@ -1,0 +1,91 @@
+---
+description: BullMQ Worker 规范——并发上限、死信队列必须配置、失败退积分模板。
+globs: ["apps/worker/**/*.ts", "packages/queue/**/*.ts"]
+alwaysApply: false
+---
+
+# BullMQ Worker 规范
+
+## Queue 定义（packages/queue/src/queues.ts）
+
+```typescript
+import { Queue } from 'bullmq'
+import { redis } from './redis'
+
+// ✅ 所有 Queue 在 packages/queue 中集中定义，api 和 worker 共用
+export const storyboardQueue = new Queue('storyboard', {
+  connection: redis,
+  defaultJobOptions: {
+    attempts: 3,                          // 最多重试 3 次
+    backoff: { type: 'exponential', delay: 5000 },
+    removeOnComplete: { count: 100 },     // 保留最近 100 条成功记录
+    removeOnFail: false,                  // 失败记录永久保留（用于调试）
+  }
+})
+
+export const produceQueue = new Queue('produce', { connection: redis, defaultJobOptions: { attempts: 2, backoff: { type: 'fixed', delay: 10000 } } })
+```
+
+## Worker 并发上限（必须配置）
+
+```typescript
+// ✅ 并发数 = Kling API 允许的最大并发数，防止限流
+const storyboardWorker = new Worker('storyboard', processStoryboard, {
+  connection: redis,
+  concurrency: 10,    // 每个 Worker 实例最多 10 个并发 Job
+  // 多台 Worker 实例时总并发 = 实例数 × 10，需保持 ≤ Kling API 限制
+})
+```
+
+## 死信队列（必须配置）
+
+```typescript
+// ✅ 所有 Worker 必须配置 failed 事件处理
+storyboardWorker.on('failed', async (job, err) => {
+  logger.error('storyboard.job.failed', {
+    jobId: job?.id,
+    projectId: job?.data.projectId,
+    attempt: job?.attemptsMade,
+    error: err.message,
+  })
+
+  // 最终失败（所有重试耗尽）时退积分 + 更新项目状态
+  if (job && job.attemptsMade >= (job.opts.attempts ?? 1)) {
+    await Promise.all([
+      refundCredits(job.data.userId, job.data.creditCost, job.data.projectId),
+      updateProjectStatus(job.data.projectId, 'failed'),
+    ])
+  }
+})
+```
+
+## Job 数据类型（必须有 Zod schema）
+
+```typescript
+// packages/queue/src/jobs.ts
+export const StoryboardJobSchema = z.object({
+  projectId:  z.string().uuid(),
+  userId:     z.string().uuid(),
+  creditCost: z.number().int().positive(),  // 用于失败退积分
+  scenes:     z.array(SceneSchema),
+  spec:       VideoSpecSchema,
+})
+
+export type StoryboardJobData = z.infer<typeof StoryboardJobSchema>
+```
+
+## 退积分函数模板
+
+```typescript
+// 必须是幂等的（同一 jobId 调用多次结果相同）
+async function refundCredits(userId: string, amount: number, projectId: string) {
+  await db.transaction(async (tx) => {
+    await tx.update(users)
+      .set({ creditBalance: sql`${users.creditBalance} + ${amount}` })
+      .where(eq(users.id, userId))
+    await tx.insert(creditTransactions).values({
+      userId, delta: amount, type: 'refund', refId: projectId
+    })
+  })
+}
+```

@@ -1,0 +1,94 @@
+---
+description: 安全规范——内容审核前置、CORS 白名单、用户隔离、PII 保护。
+globs: ["apps/api/**/*.ts", "apps/worker/**/*.ts"]
+alwaysApply: false
+---
+
+# 安全规范
+
+## 内容审核前置（必须）
+
+所有用户输入在调用 AI API 前必须先过内容安全审核：
+
+```typescript
+// apps/api/src/lib/content-moderation.ts
+// 使用阿里云内容安全 SDK：@alicloud/green20220302
+import Green20220302, * as $Green20220302 from '@alicloud/green20220302'
+
+const client = new Green20220302({
+  accessKeyId: process.env.ALIYUN_ACCESS_KEY_ID!,
+  accessKeySecret: process.env.ALIYUN_ACCESS_KEY_SECRET!,
+  endpoint: 'green-cip.cn-shanghai.aliyuncs.com',
+})
+
+export async function moderateText(text: string): Promise<void> {
+  const request = new $Green20220302.TextModerationRequest({
+    service: 'comment_detection',
+    serviceParameters: JSON.stringify({ content: text }),
+  })
+  const result = await client.textModeration(request)
+  const { code, data } = result.body
+  if (code !== 200) {
+    throw new AppError('CONTENT_MODERATION_ERROR', '内容审核服务异常', { status: 502 })
+  }
+  if (data?.labels && data.labels !== '') {
+    throw new AppError('CONTENT_MODERATION_REJECTED', '内容不符合平台规范', { status: 400 })
+  }
+}
+
+// ✅ 在 script_gen 前调用
+await moderateText(input.rawInput)
+const scenes = await generateScript(input)
+```
+
+## 用户隔离（每个查询必须带 userId）
+
+```typescript
+// ✅ 中间件注入 userId
+export const authMiddleware = createMiddleware(async (c, next) => {
+  const session = await auth.api.getSession({ headers: c.req.raw.headers })
+  if (!session) return c.json({ error: { code: 'UNAUTHORIZED' } }, 401)
+  c.set('userId', session.user.id)
+  await next()
+})
+
+// ✅ 所有数据查询必须包含 userId 过滤
+// ❌ 不能根据 projectId 直接查，必须 AND userId
+```
+
+## CORS 白名单
+
+```typescript
+// ✅ 只允许自己的域名
+app.use('*', cors({
+  origin: (origin) => {
+    const allowed = [
+      'https://vid-maker.com',
+      'https://admin.vid-maker.com',
+      process.env.NODE_ENV === 'development' ? 'http://localhost:3000' : '',
+    ].filter(Boolean)
+    return allowed.includes(origin) ? origin : null
+  },
+  credentials: true,
+}))
+```
+
+## PII 保护
+
+```typescript
+// ✅ 日志中脱敏手机号
+logger.info('user.login', {
+  userId: user.id,
+  phone: user.phone.replace(/(\d{3})\d{4}(\d{4})/, '$1****$2'), // 138****8888
+})
+
+// ❌ 禁止在日志/错误信息中打印完整手机号、openid、支付信息
+```
+
+## SQL 注入防护
+
+```typescript
+// ✅ 使用 Drizzle ORM 参数化查询，自动防注入
+// ❌ 禁止字符串拼接 SQL
+// ❌ 禁止 sql`SELECT * FROM projects WHERE id = '${userInput}'`（模板字面量是安全的，但不要用字符串拼接）
+```
